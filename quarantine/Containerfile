@@ -1,0 +1,26 @@
+# Research worker image. Built by `qr-launch build` (the only step that needs
+# package registries). Configuration is baked in read-only; nothing from the
+# host is mounted except the per-job /job folder.
+FROM docker.io/library/node:20-bookworm-slim
+
+# Pinned: 2.1.301 is known to support --restricted. Change deliberately, then re-seal.
+ARG CLAUDE_CODE_VERSION=2.1.301
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iptables python3 ca-certificates util-linux \
+ && rm -rf /var/lib/apt/lists/* \
+ && command -v setpriv && command -v iptables && command -v python3
+
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && npm cache clean --force \
+ && claude --version
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin worker
+
+COPY settings.json worker-prompt.md init-firewall.sh entrypoint.sh /opt/qr/
+COPY hooks/fetch_guard.py /opt/qr/hooks/fetch_guard.py
+RUN chmod 0555 /opt/qr/init-firewall.sh /opt/qr/entrypoint.sh /opt/qr/hooks/fetch_guard.py \
+ && chmod 0444 /opt/qr/settings.json /opt/qr/worker-prompt.md \
+ && chmod 0555 /opt/qr /opt/qr/hooks
+
+ENTRYPOINT ["/opt/qr/entrypoint.sh"]

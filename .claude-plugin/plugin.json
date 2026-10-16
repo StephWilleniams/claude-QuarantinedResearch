@@ -1,0 +1,5 @@
+{
+  "name": "quarantined-research",
+  "version": "0.1.0",
+  "description": "Deep web research in an isolated container. Reports come back sanitized, and your session stays read-only until you approve them from your own terminal."
+}

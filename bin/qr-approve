@@ -1,0 +1,129 @@
+#!/usr/bin/env -S python3 -I
+"""Approve a pending research report. Run this in your own terminal, not through Claude.
+
+  qr-approve [job-id] [--no-pager]
+
+Shows the report, asks you to type the job id, then moves the report to
+~/.qr/approved/ and clears the read-only flag once no reports are pending.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_integrity():
+    """Load lib/qr/integrity.py by path, before lib/ is importable (stdlib only)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("qr_integrity", str(ROOT / "lib" / "qr" / "integrity.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+integrity = _load_integrity()
+
+
+def seal_problem(home: Path) -> str | None:
+    diff = integrity.changed(ROOT, home)
+    if diff is None:
+        return ("STOP: the plugin's seal is missing. Inspect hooks/gate.py and hooks/hooks.json,\n"
+                "then run `qr-launch seal` and try again.")
+    if diff:
+        return ("STOP: plugin files changed since they were sealed: " + ", ".join(diff) + "\n"
+                "A session may have tampered with the gate. Inspect these files before unlocking anything.\n"
+                "If the change was yours, run `qr-launch seal`, then try again.")
+    off = integrity.hooks_disabled(Path.home())
+    if off:
+        return "STOP: hooks are disabled in " + ", ".join(off) + ". Re-enable them before unlocking."
+    return None
+
+
+def _action() -> str:
+    return "reject" if Path(sys.argv[0]).name == "qr-reject" else "approve"
+
+
+# Before importing anything else from the plugin folder: you at the keyboard, and an intact seal.
+if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    print("Run qr-%s in your own terminal; it needs you at the keyboard." % _action())
+    sys.exit(2)
+_problem = seal_problem(Path(os.environ.get("QR_HOME") or (Path.home() / ".qr")))
+if _problem:
+    print(_problem)
+    sys.exit(2)
+
+sys.path.insert(0, str(ROOT / "lib"))
+from qr import jobs  # noqa: E402
+
+
+def choose(home: Path, args: list[str]) -> str | None:
+    ids = [a for a in args if not a.startswith("--")]
+    waiting = jobs.pending(home)
+    if ids:
+        return jobs.check_job_id(ids[0])
+    if not waiting:
+        print("No reports are awaiting approval.")
+        return None
+    if len(waiting) > 1:
+        print("Several reports are waiting; name one:")
+        for j in waiting:
+            print("  " + j)
+        return None
+    return waiting[0]
+
+
+def show(report: Path) -> None:
+    env = dict(os.environ, LESSSECURE="1")
+    pager = ["less"] if subprocess.run(["which", "less"], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL).returncode == 0 else None
+    if pager:
+        # Plain less (no -R) shows any control character as ^X instead of interpreting it.
+        subprocess.run(pager + [str(report)], env=env)
+    else:
+        print(report.read_text(encoding="utf-8"))
+
+
+def main(argv: list[str], action: str) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("Run qr-%s in your own terminal; it needs you at the keyboard." % action)
+        return 2
+    home = jobs.qr_home()
+    try:
+        job_id = choose(home, argv)
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+    if not job_id:
+        return 1
+    report = home / "inbox" / job_id / "report.md"
+    if not report.is_file():
+        print("No pending report with that id.")
+        return 2
+    if "--no-pager" not in argv:
+        show(report)
+    typed = input("Type the job id to %s it (anything else cancels): " % action).strip()
+    if typed != job_id:
+        print("Cancelled.")
+        return 1
+    try:
+        cleared = jobs.approve(home, job_id) if action == "approve" else jobs.reject(home, job_id)
+    except RuntimeError as exc:
+        print(str(exc))
+        return 2
+    if action == "approve":
+        print("Approved. The report is in " + str(home / "approved" / job_id) + ".")
+    else:
+        print("Rejected and deleted. Start a new Claude session: the report may already be in its context.")
+    if cleared:
+        print("No reports pending: Claude's tools are unlocked.")
+    else:
+        print("Other reports are still pending: Claude stays read-only.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], _action()))

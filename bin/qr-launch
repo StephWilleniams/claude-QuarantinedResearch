@@ -1,0 +1,176 @@
+#!/usr/bin/env -S python3 -I
+"""Start and monitor quarantined research jobs.
+
+  qr-launch start "<question>"   start a job (or pass the question on stdin)
+  qr-launch status [job-id]      show job statuses (never report content)
+  qr-launch build                build the worker image (needs package registries)
+  qr-launch set-token            save your subscription token (run in your own terminal)
+  qr-launch seal                 record hashes of the plugin's files (run in your own terminal)
+
+Prints only job ids and statuses. Report content is never printed.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_integrity():
+    """Load lib/qr/integrity.py by path, before lib/ is importable (stdlib only)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("qr_integrity", str(ROOT / "lib" / "qr" / "integrity.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+integrity = _load_integrity()
+
+
+def preflight(home) -> str | None:
+    """Refuse to run if the plugin changed since it was sealed or hooks are switched off."""
+    diff = integrity.changed(ROOT, home)
+    if diff is None:
+        return "The plugin is not sealed yet. Run `qr-launch seal` in your own terminal."
+    if diff:
+        return "Plugin files changed since they were sealed: " + ", ".join(diff) + \
+               ". Inspect them; if the change was yours, run `qr-launch seal` in your own terminal."
+    off = integrity.hooks_disabled(Path.home(), [Path.cwd()])
+    if off:
+        return "Hooks are disabled in " + ", ".join(off) + "; the read-only gate would not work."
+    return None
+
+
+# Check the seal before importing anything else from the plugin folder.
+if sys.argv[1:2] in (["start"], ["_run"]):
+    _problem = preflight(Path(os.environ.get("QR_HOME") or (Path.home() / ".qr")))
+    if _problem:
+        print(_problem)
+        sys.exit(2)
+
+sys.path.insert(0, str(ROOT / "lib"))
+from qr import brief as qr_brief  # noqa: E402
+from qr import jobs  # noqa: E402
+
+
+def cmd_start(args) -> int:
+    home = jobs.qr_home()
+    text = " ".join(args.question) if args.question else sys.stdin.read()
+    text = text.strip()
+    problems = qr_brief.check_brief(text)
+    if problems:
+        print("Brief rejected:")
+        for p in problems:
+            print("  - " + p)
+        return 2
+    if jobs.flag_path(home).exists() or jobs.pending(home):
+        print("A report is awaiting approval. Run qr-approve or qr-reject in your own terminal first.")
+        return 2
+    try:
+        jobs.load_token(home)
+    except RuntimeError as exc:
+        print(str(exc))
+        return 2
+    if subprocess.run(["podman", "image", "exists", jobs.IMAGE], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode != 0:
+        print("Worker image not found. Run `qr-launch build` in your own terminal first.")
+        return 2
+    job_id = jobs.create_job(home, text)
+    log = open(home / "jobs" / job_id / "launcher.log", "ab")
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run", job_id],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True, close_fds=True)
+    print("Started job " + job_id + ". Check progress with: qr-launch status " + job_id)
+    return 0
+
+
+def cmd_run(args) -> int:
+    home = jobs.qr_home()
+    job_id = jobs.check_job_id(args.job_id)
+    try:
+        jobs.run_worker(home, job_id)
+    finally:
+        jobs.finalize(home, job_id)
+    return 0
+
+
+def cmd_status(args) -> int:
+    home = jobs.qr_home()
+    rows = jobs.list_jobs(home)
+    if args.job_id:
+        jobs.check_job_id(args.job_id)
+        rows = [r for r in rows if r[0] == args.job_id]
+    if not rows:
+        print("No jobs.")
+    for job_id, status in rows:
+        print(job_id + "  " + status)
+    if jobs.flag_path(home).exists():
+        print("A report is awaiting approval: run qr-approve in your own terminal.")
+    return 0
+
+
+def cmd_build(args) -> int:
+    if not sys.stdin.isatty():
+        print("Run `qr-launch build` in your own terminal.")
+        return 2
+    cmd = ["podman", "build", "-t", jobs.IMAGE, "-f", str(ROOT / "quarantine" / "Containerfile")]
+    if args.claude_code_version:   # default: the version pinned in the Containerfile
+        cmd += ["--build-arg", "CLAUDE_CODE_VERSION=" + args.claude_code_version]
+    cmd.append(str(ROOT / "quarantine"))
+    return subprocess.run(cmd).returncode
+
+
+def cmd_set_token(args) -> int:
+    if not sys.stdin.isatty():
+        print("Run `qr-launch set-token` in your own terminal.")
+        return 2
+    token = getpass.getpass("Paste the token from `claude setup-token` (input is hidden): ")
+    try:
+        jobs.save_token(jobs.qr_home(), token)
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+    print("Saved.")
+    return 0
+
+
+def cmd_seal(args) -> int:
+    if not sys.stdin.isatty():
+        print("Run `qr-launch seal` in your own terminal.")
+        return 2
+    integrity.seal(ROOT, jobs.qr_home())
+    print("Sealed " + str(len(integrity.files(ROOT))) + " files.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="qr-launch")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("start")
+    p.add_argument("question", nargs="*")
+    p.set_defaults(func=cmd_start)
+    p = sub.add_parser("status")
+    p.add_argument("job_id", nargs="?")
+    p.set_defaults(func=cmd_status)
+    p = sub.add_parser("build")
+    p.add_argument("--claude-code-version", default=None)
+    p.set_defaults(func=cmd_build)
+    p = sub.add_parser("set-token")
+    p.set_defaults(func=cmd_set_token)
+    p = sub.add_parser("seal")
+    p.set_defaults(func=cmd_seal)
+    p = sub.add_parser("_run")
+    p.add_argument("job_id")
+    p.set_defaults(func=cmd_run)
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
